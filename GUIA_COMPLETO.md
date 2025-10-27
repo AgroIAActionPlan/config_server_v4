@@ -2,7 +2,6 @@
 
 **Versão**: 4.0 Final  
 **Data**: 27 de outubro de 2025  
-**Autor**: Manus AI  
 **Status**: Testado e Validado em Produção
 
 ---
