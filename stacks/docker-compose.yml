@@ -1,0 +1,307 @@
+# Docker Compose para Stack LiaLean
+# Versão: 3.0 (Revisada e Testada)
+# Data: 2025-10-27
+
+networks:
+  proxy:
+    name: proxy
+    driver: bridge
+  internal:
+    name: internal
+    driver: bridge
+
+services:
+  # ========================================
+  # Traefik - Proxy Reverso e SSL Automático
+  # ========================================
+  traefik:
+    image: traefik:v3.1
+    container_name: traefik
+    restart: unless-stopped
+    networks:
+      - proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - TZ=${TIMEZONE}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ../data/traefik:/letsencrypt
+    command:
+      - "--api.dashboard=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=proxy"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik.rule=Host(`${TRAEFIK_HOSTNAME}`)"
+      - "traefik.http.routers.traefik.entrypoints=websecure"
+      - "traefik.http.routers.traefik.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.traefik.service=api@internal"
+      - "traefik.http.routers.traefik.middlewares=traefik-auth"
+      - "traefik.http.middlewares.traefik-auth.basicauth.users=${TRAEFIK_BASIC_AUTH}"
+
+  # ========================================
+  # Portainer - Gerenciamento de Containers
+  # ========================================
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    restart: unless-stopped
+    networks:
+      - proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ../data/portainer:/data
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.portainer.rule=Host(`${PORTAINER_HOSTNAME}`)"
+      - "traefik.http.routers.portainer.entrypoints=websecure"
+      - "traefik.http.routers.portainer.tls.certresolver=letsencrypt"
+      - "traefik.http.services.portainer.loadbalancer.server.port=9000"
+
+  # ========================================
+  # PostgreSQL - Banco de Dados
+  # ========================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    networks:
+      - internal
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - PGDATA=/var/lib/postgresql/data/pgdata
+      - TZ=${TIMEZONE}
+    volumes:
+      - ../data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # IMPORTANTE: Não mapear porta 5432 externamente para evitar conflitos
+    # Containers se comunicam via rede interna
+
+  # ========================================
+  # Redis - Cache e Filas
+  # ========================================
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    networks:
+      - internal
+    volumes:
+      - ../data/redis:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ========================================
+  # N8N Main - Automação (Interface Principal)
+  # ========================================
+  n8n-main:
+    image: n8nio/n8n:latest
+    container_name: n8n-main
+    restart: unless-stopped
+    networks:
+      - proxy
+      - internal
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_DATABASE=${N8N_DB_NAME}
+      - DB_POSTGRESDB_USER=${N8N_DB_USER}
+      - DB_POSTGRESDB_PASSWORD=${N8N_DB_PASSWORD}
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_PASS}
+      - N8N_HOST=${N8N_HOSTNAME}
+      - WEBHOOK_URL=https://${N8N_WEBHOOK_HOSTNAME}/
+      - GENERIC_TIMEZONE=${TIMEZONE}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis
+      - N8N_USER_FOLDER=/home/node/.n8n
+    volumes:
+      - ../data/n8n:/home/node/.n8n
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.n8n-main.rule=Host(`${N8N_HOSTNAME}`)"
+      - "traefik.http.routers.n8n-main.entrypoints=websecure"
+      - "traefik.http.routers.n8n-main.tls.certresolver=letsencrypt"
+      - "traefik.http.services.n8n-main.loadbalancer.server.port=5678"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ========================================
+  # N8N Webhook - Automação (Webhooks)
+  # ========================================
+  n8n-webhook:
+    image: n8nio/n8n:latest
+    container_name: n8n-webhook
+    restart: unless-stopped
+    networks:
+      - proxy
+      - internal
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_DATABASE=${N8N_DB_NAME}
+      - DB_POSTGRESDB_USER=${N8N_DB_USER}
+      - DB_POSTGRESDB_PASSWORD=${N8N_DB_PASSWORD}
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_PASS}
+      - WEBHOOK_URL=https://${N8N_WEBHOOK_HOSTNAME}/
+      - GENERIC_TIMEZONE=${TIMEZONE}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis
+      - N8N_USER_FOLDER=/home/node/.n8n
+    command: webhook
+    volumes:
+      - ../data/n8n:/home/node/.n8n
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.n8n-webhook.rule=Host(`${N8N_WEBHOOK_HOSTNAME}`)"
+      - "traefik.http.routers.n8n-webhook.entrypoints=websecure"
+      - "traefik.http.routers.n8n-webhook.tls.certresolver=letsencrypt"
+      - "traefik.http.services.n8n-webhook.loadbalancer.server.port=5678"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ========================================
+  # N8N Worker - Automação (Execução de Workflows)
+  # ========================================
+  n8n-worker:
+    image: n8nio/n8n:latest
+    container_name: n8n-worker
+    restart: unless-stopped
+    networks:
+      - internal
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_DATABASE=${N8N_DB_NAME}
+      - DB_POSTGRESDB_USER=${N8N_DB_USER}
+      - DB_POSTGRESDB_PASSWORD=${N8N_DB_PASSWORD}
+      - GENERIC_TIMEZONE=${TIMEZONE}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis
+      - N8N_USER_FOLDER=/home/node/.n8n
+    command: worker
+    volumes:
+      - ../data/n8n:/home/node/.n8n
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ========================================
+  # MariaDB - Banco de Dados para WordPress
+  # ========================================
+  mariadb:
+    image: mariadb:10.6
+    container_name: mariadb
+    restart: unless-stopped
+    networks:
+      - internal
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MARIADB_ROOT_PASSWORD}
+      - MYSQL_DATABASE=wordpress
+      - MYSQL_USER=wordpress
+      - MYSQL_PASSWORD=${WP_DB_PASSWORD}
+      - TZ=${TIMEZONE}
+    volumes:
+      - ../data/mariadb:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MARIADB_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ========================================
+  # WordPress - CMS
+  # ========================================
+  wordpress:
+    image: wordpress:latest
+    container_name: wordpress
+    restart: unless-stopped
+    networks:
+      - proxy
+      - internal
+    environment:
+      - WORDPRESS_DB_HOST=mariadb
+      - WORDPRESS_DB_NAME=wordpress
+      - WORDPRESS_DB_USER=wordpress
+      - WORDPRESS_DB_PASSWORD=${WP_DB_PASSWORD}
+      - WORDPRESS_CONFIG_EXTRA=
+          define('WP_HOME', 'https://${WP_HOSTNAME}');
+          define('WP_SITEURL', 'https://${WP_HOSTNAME}');
+    volumes:
+      - ../data/wordpress:/var/www/html
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.wordpress.rule=Host(`${WP_HOSTNAME}`)"
+      - "traefik.http.routers.wordpress.entrypoints=websecure"
+      - "traefik.http.routers.wordpress.tls.certresolver=letsencrypt"
+      - "traefik.http.services.wordpress.loadbalancer.server.port=80"
+    depends_on:
+      mariadb:
+        condition: service_healthy
+
+  # ========================================
+  # Site LiaLean - Aplicação Full-Stack
+  # ========================================
+  lialean-site:
+    build:
+      context: ../apps/lialean-site
+      dockerfile: Dockerfile
+    container_name: lialean-site
+    restart: unless-stopped
+    networks:
+      - proxy
+      - internal
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DATABASE_URL=postgresql://${LIALEAN_DB_USER}:${LIALEAN_DB_PASSWORD}@postgres:5432/${LIALEAN_DB_NAME}
+      - JWT_SECRET=${LIALEAN_JWT_SECRET}
+      - VITE_APP_TITLE=${LIALEAN_SITE_TITLE}
+      - VITE_APP_LOGO=${LIALEAN_SITE_LOGO}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.lialean-site.rule=Host(`lialean.cloud`) || Host(`www.lialean.cloud`)"
+      - "traefik.http.routers.lialean-site.entrypoints=websecure"
+      - "traefik.http.routers.lialean-site.tls.certresolver=letsencrypt"
+      - "traefik.http.services.lialean-site.loadbalancer.server.port=3000"
+      # Middleware para redirecionar www para domínio raiz
+      - "traefik.http.middlewares.lialean-redirect.redirectregex.regex=^https://www\\.lialean\\.cloud/(.*)"
+      - "traefik.http.middlewares.lialean-redirect.redirectregex.replacement=https://lialean.cloud/$${1}"
+      - "traefik.http.routers.lialean-site.middlewares=lialean-redirect"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
